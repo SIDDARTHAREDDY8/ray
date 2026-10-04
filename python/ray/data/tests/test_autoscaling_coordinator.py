@@ -1,4 +1,5 @@
 import copy
+import threading
 from unittest.mock import Mock
 
 import pytest
@@ -1310,6 +1311,74 @@ def test_proxy_passes_caller_label_selectors_through():
     kwargs = mock_actor.request_resources.remote.call_args.kwargs
     assert kwargs["label_selectors"] == [{"node_id": "n1"}]
     assert kwargs["subcluster_selector"] == {"ray-subcluster": "training"}
+
+
+def test_reallocation_does_not_block_concurrent_reads(monkeypatch):
+    """Regression test for https://github.com/ray-project/ray/issues/63924.
+
+    The O(R*N^2) placement pass in ``_refresh_resource_reservations`` must not
+    run while holding the coordinator's ``self._lock``: a concurrent
+    ``get_reserved_resources`` call must complete even while a reallocation is
+    in flight. The placement computation is stalled on an event here to prove
+    deterministically that the reader does not block behind it.
+    """
+    import ray.data._internal.cluster_autoscaler.default_autoscaling_coordinator as coordinator_module
+
+    as_coordinator = _AutoscalingCoordinatorActor(
+        get_current_time=lambda: 0,
+        send_resources_request=Mock(),
+        get_cluster_nodes=lambda: CLUSTER_NODES_WITHOUT_HEAD,
+    )
+    as_coordinator.request_resources(
+        requester_id="requester1",
+        resources=[{"CPU": 1}],
+        expire_after_s=60,
+    )
+    assert as_coordinator.get_reserved_resources("requester1") == {"n1": {"CPU": 1}}
+
+    compute_started = threading.Event()
+    release_compute = threading.Event()
+    real_compute_reservations = coordinator_module._compute_reservations
+
+    def stalled_compute(*args, **kwargs):
+        compute_started.set()
+        assert release_compute.wait(timeout=30), "compute was never released"
+        return real_compute_reservations(*args, **kwargs)
+
+    monkeypatch.setattr(coordinator_module, "_compute_reservations", stalled_compute)
+
+    # Trigger a reallocation (as request_resources/cancel_request/_tick do)
+    # while the placement computation is stalled.
+    realloc_thread = threading.Thread(
+        target=as_coordinator.request_resources,
+        kwargs={
+            "requester_id": "requester2",
+            "resources": [{"CPU": 1}],
+            "expire_after_s": 60,
+        },
+    )
+    realloc_thread.start()
+    assert compute_started.wait(timeout=30), "reallocation never started"
+
+    # The reader must not block behind the stalled reallocation.
+    read_result = {}
+
+    def reader():
+        read_result["resources"] = as_coordinator.get_reserved_resources("requester1")
+
+    read_thread = threading.Thread(target=reader)
+    read_thread.start()
+    read_thread.join(timeout=10)
+    try:
+        assert not read_thread.is_alive(), (
+            "get_reserved_resources blocked on the coordinator lock while the "
+            "placement computation was running (issue #63924)"
+        )
+        assert read_result["resources"] == {"n1": {"CPU": 1}}
+    finally:
+        release_compute.set()
+        realloc_thread.join(timeout=30)
+        read_thread.join(timeout=30)
 
 
 if __name__ == "__main__":

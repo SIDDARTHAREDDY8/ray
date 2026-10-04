@@ -4,7 +4,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, Dict, FrozenSet, List, Optional, Set
+from typing import Callable, Dict, FrozenSet, List, Optional, Set, Tuple
 
 import ray
 import ray.exceptions
@@ -187,6 +187,11 @@ class OngoingRequest:
     # on 1st label key and so forth. I don't think this is an issue because train has uniform
     # resource request, and data doesn't use label selectors.
     strategy: ResourceRequestStrategy
+    # Monotonic version of this request. Bumped on every update so the
+    # lock-free placement pass (see _refresh_resource_reservations) can tell
+    # whether the live request is still the one it snapshotted; a re-added
+    # request always gets a fresh revision, never a reused one.
+    revision: int = 0
 
     def requested_resources_sum(self) -> ResourceDict:
         bundle_sum: ResourceDict = {}
@@ -203,6 +208,34 @@ class OngoingRequest:
         if self.priority != other.priority:
             return self.priority > other.priority
         return self.first_request_time < other.first_request_time
+
+
+@dataclass
+class _ReservationInput:
+    """Immutable snapshot of one requester's state for the placement pass.
+
+    Lets the O(R*N^2) reservation computation in
+    ``_refresh_resource_reservations`` run without holding the coordinator
+    lock (issue #63924): inputs are snapshotted under the lock, the placement
+    runs lock-free, and results are applied back under the lock only for
+    requesters whose ``revision`` is unchanged since the snapshot.
+    """
+
+    # The requester this input belongs to.
+    requester_id: RequesterId
+    # Revision of the live request at snapshot time.
+    revision: int
+    # Requested resources (copies; the placement pass never mutates them).
+    requested_resources: List[ResourceDict]
+    # Per-bundle label selectors, parallel to ``requested_resources``.
+    requested_label_selectors: List[LabelSelector]
+    # Resource types for which leftover cluster capacity should also be
+    # reserved. Empty means do not reserve leftovers.
+    request_remaining: FrozenSet[ResourceType]
+    # The placement strategy of the request.
+    strategy: ResourceRequestStrategy
+    # The subcluster this requester is pinned to (None bucket if unlabeled).
+    subcluster: Optional[LabelValue]
 
 
 class DefaultAutoscalingCoordinator(AutoscalingCoordinator):
@@ -347,6 +380,10 @@ class _AutoscalingCoordinatorActor:
         self._ongoing_reqs: Dict[RequesterId, OngoingRequest] = {}
         # Map from requester id to its subcluster selector.
         self._subcluster_selectors: Dict[RequesterId, Optional[LabelSelector]] = {}
+        # Monotonic counter backing OngoingRequest.revision; never reused, so
+        # the lock-free placement pass can always tell a stale requester apart
+        # from a re-added one.
+        self._revision_counter = 0
         # Node resources bucketed by their ``SUBCLUSTER_LABEL_KEY`` value.
         # Nodes without the key fall under ``DEFAULT_SUBCLUSTER``.
         self._cluster_node_resources: Dict[Optional[LabelValue], NodeResources] = {}
@@ -366,6 +403,11 @@ class _AutoscalingCoordinatorActor:
             self._tick_thread = threading.Thread(target=tick_thread_run, daemon=True)
             self._tick_thread.start()
 
+    def _next_revision(self) -> int:
+        """Return a fresh, never-reused request revision."""
+        self._revision_counter += 1
+        return self._revision_counter
+
     def _tick(self):
         """Used to perform periodical operations, e.g., purge expired requests,
         merge and send requests, check cluster resource updates, etc.
@@ -379,7 +421,10 @@ class _AutoscalingCoordinatorActor:
             with self._lock:
                 self._merge_and_send_requests()
                 self._update_cluster_node_resources()
-                self._refresh_resource_reservations()
+            # The O(R*N^2) placement pass runs lock-free on a snapshot
+            # (issue #63924); never hold the lock across it, or concurrent
+            # client calls starve behind it.
+            self._refresh_resource_reservations()
         except Exception:
             logger.warning(
                 "AutoscalingCoordinator tick failed; reservations may be stale"
@@ -470,6 +515,7 @@ class _AutoscalingCoordinatorActor:
                 old_req.requested_resources = resources
                 old_req.requested_label_selectors = label_selectors
                 old_req.expiration_time = now + expire_after_s
+                old_req.revision = self._next_revision()
             else:
                 request_updated = True
                 self._ongoing_reqs[requester_id] = OngoingRequest(
@@ -481,15 +527,19 @@ class _AutoscalingCoordinatorActor:
                     expiration_time=now + expire_after_s,
                     reserved_resources={},
                     strategy=strategy,
+                    revision=self._next_revision(),
                 )
             # Write subcluster after all validations so a rejected call
             # never leaves the registry on a new subcluster.
             self._subcluster_selectors[requester_id] = subcluster_selector
             if request_updated:
-                # If the request has updated, immediately send
-                # a new request and rereserve resources.
+                # If the request has updated, immediately send a new request.
+                # Reservations are recomputed below without holding the lock:
+                # the O(R*N^2) placement pass runs on a snapshot (issue
+                # #63924), so concurrent client calls never block on it.
                 self._merge_and_send_requests()
-                self._refresh_resource_reservations()
+        if request_updated:
+            self._refresh_resource_reservations()
 
     def cancel_request(
         self,
@@ -502,7 +552,9 @@ class _AutoscalingCoordinatorActor:
             del self._ongoing_reqs[requester_id]
             self._subcluster_selectors.pop(requester_id, None)
             self._merge_and_send_requests()
-            self._refresh_resource_reservations()
+        # Placement runs lock-free on a snapshot (issue #63924); don't hold
+        # the lock across it.
+        self._refresh_resource_reservations()
 
     def _purge_expired_requests(self):
         now = self._get_current_time()
@@ -631,90 +683,176 @@ class _AutoscalingCoordinatorActor:
 
         Each requester's subcluster comes from its ``subcluster_selector``.
         A requester without one is eligible only for the ``None`` bucket.
+
+        The O(R*N^2) placement pass does NOT hold ``self._lock`` (issue
+        #63924): inputs are snapshotted under the lock, the placement runs
+        lock-free, and results are swapped back under the lock. A result is
+        applied only if its requester is unchanged since the snapshot
+        (matched by ``revision``); a request that changed or was canceled
+        mid-compute is recomputed by the next refresh.
         """
-        now = self._get_current_time()
-        cluster_node_resources = copy.deepcopy(self._cluster_node_resources)
-        live_items = [
-            (req_id, req)
-            for req_id, req in self._ongoing_reqs.items()
-            if req.expiration_time >= now
-        ]
-        live_items.sort(key=lambda item: item[1])
+        snapshots, cluster_node_resources = self._snapshot_reservation_inputs()
+        reservations = _compute_all_reservations(snapshots, cluster_node_resources)
+        self._apply_reservations(snapshots, reservations)
 
-        def _subcluster_of(requester_id: RequesterId) -> Optional[LabelValue]:
-            selector = self._subcluster_selectors.get(requester_id)
-            return (selector or {}).get(SUBCLUSTER_LABEL_KEY, DEFAULT_SUBCLUSTER)
+    def _snapshot_reservation_inputs(
+        self,
+    ) -> Tuple[List[_ReservationInput], Dict[Optional[LabelValue], NodeResources]]:
+        """Snapshot reservation inputs under the lock.
 
-        # TODO(hchen): Optimize the following triple loop.
-        for requester_id, ongoing_req in live_items:
-            ongoing_req.reserved_resources = {}
-            subcluster = _subcluster_of(requester_id)
-            node_resources = cluster_node_resources.get(subcluster, {})
-            reservations = _compute_reservations(
-                ongoing_request=ongoing_req,
-                node_resources=node_resources,
-            )
-            for node_id, bundle in reservations.items():
-                _subtract_bundle_in_place(node_resources[node_id], bundle)
-                _add_bundle_in_place(
-                    ongoing_req.reserved_resources.setdefault(node_id, {}),
-                    bundle,
-                )
-
-        # Reserve remaining resources. For each resource type, concurrent
-        # requesters in the same subcluster that asked for that type, split
-        # the leftover equally.
-        remaining_items = [
-            (req_id, req) for req_id, req in live_items if req.request_remaining
-        ]
-        for subcluster, node_resources_leftover in cluster_node_resources.items():
-            eligible = [
-                req
-                for req_id, req in remaining_items
-                if _subcluster_of(req_id) == subcluster
+        Cheap (O(R + N)): just copies the live requests and node resources so
+        the placement pass can run without holding the lock.
+        """
+        with self._lock:
+            now = self._get_current_time()
+            live_items = [
+                (req_id, req)
+                for req_id, req in self._ongoing_reqs.items()
+                if req.expiration_time >= now
             ]
-            if not eligible:
-                continue
-            for node_id, node_resource_leftover in node_resources_leftover.items():
-                for res_type, amount in node_resource_leftover.items():
-                    if amount <= 0:
-                        continue
-                    type_eligible = [
-                        req for req in eligible if res_type in req.request_remaining
-                    ]
-                    if not type_eligible:
-                        continue
-                    # Integer division may leave some resources unreserved.
-                    share = amount // len(type_eligible)
-                    if share <= 0:
-                        continue
-                    for r in type_eligible:
-                        _add_bundle_in_place(
-                            r.reserved_resources.setdefault(node_id, {}),
-                            {res_type: share},
-                        )
+            live_items.sort(key=lambda item: item[1])
+            snapshots = [
+                _ReservationInput(
+                    requester_id=req_id,
+                    revision=req.revision,
+                    requested_resources=[
+                        dict(bundle) for bundle in req.requested_resources
+                    ],
+                    requested_label_selectors=[
+                        dict(selector) for selector in req.requested_label_selectors
+                    ],
+                    request_remaining=req.request_remaining,
+                    strategy=req.strategy,
+                    subcluster=(self._subcluster_selectors.get(req_id) or {}).get(
+                        SUBCLUSTER_LABEL_KEY, DEFAULT_SUBCLUSTER
+                    ),
+                )
+                for req_id, req in live_items
+            ]
+            # Deep copy: the placement pass subtracts from node capacities.
+            cluster_node_resources = copy.deepcopy(self._cluster_node_resources)
+        return snapshots, cluster_node_resources
 
-        if logger.isEnabledFor(logging.DEBUG):
-            msg = "Reserved resources:\n"
-            for requester_id, ongoing_req in self._ongoing_reqs.items():
-                requested_resources_log_str = _format_resource_bundles_for_log(
-                    ongoing_req.requested_resources
-                )
-                reserved_resources_log_str = _format_node_resources_for_log(
-                    ongoing_req.reserved_resources
-                )
-                msg += (
-                    f"Requester {requester_id}: wants {requested_resources_log_str}, "
-                    f"has {reserved_resources_log_str}\n"
-                )
-            logger.debug(msg)
+    def _apply_reservations(
+        self,
+        snapshots: List[_ReservationInput],
+        reservations: Dict[RequesterId, ReservedResources],
+    ):
+        """Swap computed reservations in under the lock.
+
+        Skips requesters that changed or were canceled mid-compute; their
+        stale results are dropped and the next refresh recomputes them.
+        """
+        with self._lock:
+            for snapshot in snapshots:
+                req = self._ongoing_reqs.get(snapshot.requester_id)
+                if req is None or req.revision != snapshot.revision:
+                    continue
+                req.reserved_resources = reservations[snapshot.requester_id]
+            if logger.isEnabledFor(logging.DEBUG):
+                msg = "Reserved resources:\n"
+                for requester_id, ongoing_req in self._ongoing_reqs.items():
+                    requested_resources_log_str = _format_resource_bundles_for_log(
+                        ongoing_req.requested_resources
+                    )
+                    reserved_resources_log_str = _format_node_resources_for_log(
+                        ongoing_req.reserved_resources
+                    )
+                    msg += (
+                        f"Requester {requester_id}: wants {requested_resources_log_str}, "
+                        f"has {reserved_resources_log_str}\n"
+                    )
+                logger.debug(msg)
+
+
+def _requested_resources_sum(bundles: List[ResourceDict]) -> ResourceDict:
+    """Sum a list of resource bundles into a single bundle."""
+    bundle_sum: ResourceDict = {}
+    for bundle in bundles:
+        for key, val in bundle.items():
+            bundle_sum[key] = bundle_sum.get(key, 0) + val
+    return bundle_sum
+
+
+def _compute_all_reservations(
+    snapshots: List[_ReservationInput],
+    cluster_node_resources: Dict[Optional[LabelValue], NodeResources],
+) -> Dict[RequesterId, ReservedResources]:
+    """Compute per-node reservations for all snapshot requests.
+
+    Lock-free: operates only on the snapshot inputs (a private deep copy of
+    the node resources), so callers must not hold the coordinator lock while
+    calling this. Placement semantics are unchanged from
+    ``_refresh_resource_reservations``: bundles are placed in priority order,
+    then leftover capacity is split equally per resource type among eligible
+    requesters in the same subcluster.
+
+    Args:
+        snapshots: Reservation inputs, sorted by request priority.
+        cluster_node_resources: Per-subcluster node capacities. Mutated as
+            bundles are placed (it is the caller's private copy).
+
+    Returns:
+        Resources to reserve, keyed by requester id then node id.
+    """
+    reservations: Dict[RequesterId, ReservedResources] = {
+        snapshot.requester_id: {} for snapshot in snapshots
+    }
+
+    # TODO(hchen): Optimize the following triple loop.
+    for snapshot in snapshots:
+        reserved = reservations[snapshot.requester_id]
+        node_resources = cluster_node_resources.get(snapshot.subcluster, {})
+        placed = _compute_reservations(
+            reservation_input=snapshot,
+            node_resources=node_resources,
+        )
+        for node_id, bundle in placed.items():
+            _subtract_bundle_in_place(node_resources[node_id], bundle)
+            _add_bundle_in_place(
+                reserved.setdefault(node_id, {}),
+                bundle,
+            )
+
+    # Reserve remaining resources. For each resource type, concurrent
+    # requesters in the same subcluster that asked for that type, split
+    # the leftover equally.
+    remaining = [snapshot for snapshot in snapshots if snapshot.request_remaining]
+    for subcluster, node_resources_leftover in cluster_node_resources.items():
+        eligible = [
+            snapshot for snapshot in remaining if snapshot.subcluster == subcluster
+        ]
+        if not eligible:
+            continue
+        for node_id, node_resource_leftover in node_resources_leftover.items():
+            for res_type, amount in node_resource_leftover.items():
+                if amount <= 0:
+                    continue
+                type_eligible = [
+                    snapshot
+                    for snapshot in eligible
+                    if res_type in snapshot.request_remaining
+                ]
+                if not type_eligible:
+                    continue
+                # Integer division may leave some resources unreserved.
+                share = amount // len(type_eligible)
+                if share <= 0:
+                    continue
+                for snapshot in type_eligible:
+                    _add_bundle_in_place(
+                        reservations[snapshot.requester_id].setdefault(node_id, {}),
+                        {res_type: share},
+                    )
+
+    return reservations
 
 
 def _compute_reservations(
-    ongoing_request: OngoingRequest,
+    reservation_input: _ReservationInput,
     node_resources: NodeResources,
 ) -> ReservedResources:
-    """Compute per-node reservations for ``ongoing_request`` without mutating inputs.
+    """Compute per-node reservations for ``reservation_input`` without mutating inputs.
 
     Reservation is best effort in all strategies: a bundle that fits nowhere is
     skipped and the remaining bundles are still attempted, so a partially
@@ -722,7 +860,7 @@ def _compute_reservations(
     comparing what came back against what they asked for.
 
     Args:
-        ongoing_request: The request to place.
+        reservation_input: The request to place.
         node_resources: Remaining per-node capacity. Not mutated; a working copy
             is used so later bundles in this request see prior placements.
 
@@ -735,15 +873,15 @@ def _compute_reservations(
         node_id: dict(resources) for node_id, resources in node_resources.items()
     }
     node_items = list(available.items())
-    if not node_items or not ongoing_request.requested_resources:
+    if not node_items or not reservation_input.requested_resources:
         return {}
 
-    strategy = ongoing_request.strategy
+    strategy = reservation_input.strategy
     reservations: ReservedResources = {}
 
     if strategy is ResourceRequestStrategy.STRICT_PACK:
         for node_id, node_resource in node_items:
-            bundle = ongoing_request.requested_resources_sum()
+            bundle = _requested_resources_sum(reservation_input.requested_resources)
             if _bundle_can_fit_on_node(bundle=bundle, node=node_resource):
                 _subtract_bundle_in_place(node_resource, bundle)
                 _add_bundle_in_place(
@@ -756,7 +894,7 @@ def _compute_reservations(
 
     used_node_ids: Set[NodeIdStr] = set()
     scan_start: int = 0
-    for bundle in ongoing_request.requested_resources:
+    for bundle in reservation_input.requested_resources:
         for offset in range(len(node_items)):
             idx = (scan_start + offset) % len(node_items)
             node_id, node_resource = node_items[idx]
